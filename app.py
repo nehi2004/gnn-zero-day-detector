@@ -59,6 +59,7 @@ st.markdown("""
         margin-top: 10px; margin-bottom: 10px;
     }
     div[data-testid="stSidebar"] { background-color: #12151d; }
+    [data-testid="stHeaderActionElements"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -115,6 +116,64 @@ def compute_full_metrics(_model, _graph, graph_name):
         "n_nodes": _graph.num_nodes, "n_edges": _graph.edge_index.shape[1],
     }
 
+
+
+# --- GRAPH HELPERS START ---
+def build_adjacency(edge_index_np, n_nodes):
+    adj = [[] for _ in range(n_nodes)]
+    for s_, t_ in zip(edge_index_np[0].tolist(), edge_index_np[1].tolist()):
+        adj[s_].append(t_)
+    return [sorted(set(a)) for a in adj]
+
+
+def pick_subgraph(adj, preds, focus_node=None, seed=1, per_class_seeds=2, per_seed=14):
+    """Pick a few CONNECTED neighbourhoods (ego-networks) so edges are actually visible.
+    (A random sample of nodes from a 26k-node graph almost never contains edges.)"""
+    rng = np.random.default_rng(seed)
+    seeds = []
+    if focus_node is not None:
+        seeds.append(int(focus_node))
+    for cls in (1, 0):
+        pool = np.where(preds == cls)[0]
+        if len(pool) > 0:
+            k = min(per_class_seeds, len(pool))
+            seeds.extend(rng.choice(pool, size=k, replace=False).tolist())
+
+    selected = set()
+    for sd in seeds:
+        selected.add(sd)
+        nbrs = adj[sd]
+        if nbrs:
+            take = min(per_seed, len(nbrs))
+            selected.update(rng.choice(nbrs, size=take, replace=False).tolist())
+
+    edges = set()
+    for u in selected:
+        for v in adj[u]:
+            if v in selected and u != v:
+                edges.add((min(u, v), max(u, v)))
+    return sorted(selected), sorted(edges), seeds
+
+
+def draw_subgraph(ax, nodes, edges, preds, focus_node=None):
+    G_ = nx.Graph()
+    G_.add_nodes_from(nodes)
+    G_.add_edges_from(edges)
+    pos_ = nx.spring_layout(G_, seed=42, k=0.35, iterations=80)
+    colors_ = ['#e74c3c' if preds[n] == 1 else '#2ecc71' for n in G_.nodes()]
+    nx.draw_networkx_edges(G_, pos_, ax=ax, edge_color='#8a94ad', width=1.3, alpha=0.9)
+    nx.draw_networkx_nodes(G_, pos_, ax=ax, node_color=colors_, node_size=130, alpha=0.95)
+    if focus_node is not None and focus_node in G_:
+        c_ = '#e74c3c' if preds[focus_node] == 1 else '#2ecc71'
+        nx.draw_networkx_nodes(G_, pos_, ax=ax, nodelist=[focus_node], node_color=c_,
+                               node_size=460, edgecolors='white', linewidths=2.5)
+    ax.axis('off')
+# --- GRAPH HELPERS END ---
+
+
+@st.cache_data(show_spinner=False)
+def cached_adjacency(_graph, graph_name):
+    return build_adjacency(_graph.edge_index.cpu().numpy(), _graph.num_nodes)
 
 model, known_graph, zero_day_graph = load_model_and_data()
 
@@ -211,6 +270,14 @@ with c5:
     st.markdown(f"""<div class="metric-card"><div class="metric-label">Detected Attacks</div>
     <div class="metric-value metric-red">{metrics['n_attack']}</div></div>""", unsafe_allow_html=True)
 
+if graph_key == "known":
+    st.caption(f"ℹ️ Cards show the model's score over all {metrics['n_nodes']:,} sampled flows (this includes flows used in training). "
+               "Score on the held-out test split from training: Accuracy 99.72% · F1 99.84%.")
+else:
+    half = metrics['n_nodes'] // 2
+    st.caption(f"ℹ️ Zero-day set: {half:,} attack flows from Worms + Backdoor (never seen in training) plus {half:,} benign flows. "
+               "Benign traffic is part of training too; only these attack types are unseen.")
+
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ============================================================
@@ -220,27 +287,19 @@ col_left, col_right = st.columns([1.6, 1])
 
 with col_left:
     st.markdown('<div class="section-header">🌐 Network Graph Overview</div>', unsafe_allow_html=True)
-    edge_index = active_graph.edge_index.cpu().numpy()
-    np.random.seed(1)
-    sample_nodes = set(np.random.choice(active_graph.num_nodes, size=min(60, active_graph.num_nodes), replace=False))
-    mask = np.isin(edge_index[0], list(sample_nodes)) & np.isin(edge_index[1], list(sample_nodes))
-    sub_edges = edge_index[:, mask][:, :150]
-
-    G = nx.Graph()
-    G.add_nodes_from(sample_nodes)
-    G.add_edges_from(zip(sub_edges[0], sub_edges[1]))
+    adj = cached_adjacency(active_graph, graph_key)
+    focus = int(node_idx) if analyze_btn else None
+    sub_nodes, sub_edges, _ = pick_subgraph(adj, metrics['preds'], focus_node=focus)
 
     fig, ax = plt.subplots(figsize=(7, 5))
     fig.patch.set_facecolor('#0e1117')
     ax.set_facecolor('#0e1117')
-    pos = nx.spring_layout(G, seed=42, k=0.4)
-    labels_np = metrics['preds']
-    node_colors = ['#e74c3c' if labels_np[n] == 1 else '#2ecc71' for n in G.nodes()]
-    nx.draw_networkx_edges(G, pos, ax=ax, edge_color='#3a4050', width=0.8, alpha=0.6)
-    nx.draw_networkx_nodes(G, pos, ax=ax, node_color=node_colors, node_size=90, alpha=0.9)
-    ax.axis('off')
+    draw_subgraph(ax, sub_nodes, sub_edges, metrics['preds'], focus_node=focus)
     st.pyplot(fig)
-    st.caption("🔴 Predicted Attack &nbsp;&nbsp;|&nbsp;&nbsp; 🟢 Predicted Benign (sample shown for readability)")
+    cap = "🔴 Predicted Attack &nbsp;|&nbsp; 🟢 Predicted Benign &nbsp;|&nbsp; Lines = similar flows (KNN, k=8). A few connected neighbourhoods are shown, not the whole graph."
+    if focus is not None:
+        cap += " &nbsp;⚪ White ring = the flow being analyzed."
+    st.caption(cap)
 
 with col_right:
     st.markdown('<div class="section-header">📊 Traffic Summary</div>', unsafe_allow_html=True)
@@ -258,6 +317,10 @@ with col_right:
     - **Total Edges:** {metrics['n_edges']}
     - **Graph Type:** KNN Flow-Similarity Graph
     """)
+    if graph_key == "known":
+        st.caption("Class-balanced sample (each attack type capped at 4,000 flows). In the full dataset about 96.2% of flows are benign.")
+    else:
+        st.caption("Balanced 50/50 test set by design.")
 
 st.markdown("---")
 
