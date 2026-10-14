@@ -1,0 +1,9 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torch-geometric
+streamlit
+numpy
+pandas
+scikit-learn
+matplotlib
+networkx
